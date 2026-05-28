@@ -758,6 +758,87 @@ fn per_path_observed_address() -> TestResult {
     Ok(())
 }
 
+/// When a packet containing an OBSERVED_ADDR for path 1 is lost, the retransmit must fire on
+/// path 1 (not on path 0). The retransmit flag is global, so a buggy implementation lets path 0
+/// "consume" the retransmit for path 1, leaving path 1's address unreported to the peer.
+#[test]
+fn address_discovery_retransmission_wrong_path() -> TestResult {
+    let _guard = subscribe();
+
+    let transport_cfg = TransportConfig {
+        max_concurrent_multipath_paths: NonZeroU32::new(MAX_PATHS),
+        address_discovery_role: crate::address_discovery::Role::Both,
+        ..TransportConfig::default()
+    };
+
+    let mut pair = ConnPair::with_transport_cfg(transport_cfg.clone(), transport_cfg);
+    pair.drive();
+
+    // Drain the initial ObservedAddr events produced by path 0's establishment.
+    while pair.poll(Client).is_some() {}
+    while pair.poll(Server).is_some() {}
+
+    // Open a second path. The server will send its first OBSERVED_ADDR on path 1 in the same
+    // drive step that validates path 1 on the server side.
+    let server_addr = pair.routes.public_server_addr();
+    pair.open_path(
+        Client,
+        FourTuple::from_remote(server_addr),
+        PathStatus::Available,
+    )?;
+
+    // Advance step-by-step. The instant the client fires PathEvent::Established for path 1,
+    // the server has already placed its first path-1 data packet (containing OBSERVED_ADDR)
+    // into pair.client.inbound during the same step's drive_server.
+    let mut established = false;
+    for _ in 0..20 {
+        pair.step();
+        while let Some(event) = pair.poll(Client) {
+            if matches!(event, Event::Path(PathEvent::Established { id: PathId(1) })) {
+                established = true;
+            }
+        }
+        if established {
+            break;
+        }
+    }
+    assert!(
+        established,
+        "path 1 should have been established within 20 steps"
+    );
+
+    // Drop the server-to-client packets queued this step. This simulates the server's first
+    // path-1 packet (which carries OBSERVED_ADDR for path 1) being lost in transit.
+    assert!(
+        !pair.client.inbound.is_empty(),
+        "server should have sent at least one packet (with OBSERVED_ADDR) to the client after validating path 1",
+    );
+    pair.client.inbound.clear();
+
+    // Drive to completion. The server detects the loss after the RTO and retransmits.
+    // A correct implementation retransmits on path 1. A buggy one retransmits on path 0,
+    // sending path 0's (already-known) address and leaving path 1's address undelivered.
+    pair.drive();
+
+    // Drain all remaining events and check that path 1's address was eventually reported.
+    let mut got_path1_observed_addr = false;
+    while let Some(event) = pair.poll(Client) {
+        if matches!(
+            event,
+            Event::Path(PathEvent::ObservedAddr { id: PathId(1), .. })
+        ) {
+            got_path1_observed_addr = true;
+        }
+    }
+
+    assert!(
+        got_path1_observed_addr,
+        "client should receive ObservedAddr for path 1 via retransmit"
+    );
+
+    Ok(())
+}
+
 #[test]
 fn mtud_on_two_paths() -> TestResult {
     let _guard = subscribe();
