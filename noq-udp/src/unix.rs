@@ -434,9 +434,16 @@ fn send(
                 // when we try to actually send datagrams using it.
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 if let Some(libc::EIO) | Some(libc::EINVAL) = e.raw_os_error() {
-                    // Prevent new transmits from being scheduled using GSO. Existing GSO transmits
-                    // may already be in the pipeline, so we need to tolerate additional failures.
-                    if state.max_gso_segments().get() > 1 {
+                    // Only a send that was ACTUALLY segmented (carrying a UDP_SEGMENT batch,
+                    // i.e. `transmit.effective_segment_size()` is `Some`) can have failed
+                    // BECAUSE of segmentation offload. A non-segmented single-datagram send
+                    // hitting EIO/EINVAL failed for an unrelated reason (e.g. the route-lookup
+                    // failure a loopback-bound mesh socket hits sending to a LAN destination)
+                    // and must not halt segmentation offload for transmits that never used it
+                    // (rafka i124.e4, GH#1044).
+                    if transmit.effective_segment_size().is_some() && state.max_gso_segments().get() > 1 {
+                        // Prevent new transmits from being scheduled using GSO. Existing GSO transmits
+                        // may already be in the pipeline, so we need to tolerate additional failures.
                         crate::log::info!(
                             "`libc::sendmsg` failed with {e}; halting segmentation offload"
                         );
