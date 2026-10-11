@@ -1917,3 +1917,74 @@ impl crate::runtime::Runtime for PanicPropagatingRuntime {
         TokioRuntime.now()
     }
 }
+
+/// A [`Runtime`] that holds the first future it is asked to spawn (the `EndpointDriver`,
+/// `Endpoint::new_with_abstract_socket`) instead of running it, so a test decides when the driver
+/// drops; every later spawn runs on tokio.
+#[derive(Default)]
+struct HoldEndpointDriver {
+    held: std::sync::Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>,
+    spawned: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for HoldEndpointDriver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HoldEndpointDriver").finish_non_exhaustive()
+    }
+}
+
+impl crate::runtime::Runtime for HoldEndpointDriver {
+    fn new_timer(&self, t: Instant) -> Pin<Box<dyn AsyncTimer>> {
+        TokioRuntime.new_timer(t)
+    }
+
+    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        if self.spawned.swap(true, Ordering::SeqCst) {
+            tokio::spawn(future);
+        } else {
+            *self.held.lock().unwrap() = Some(future);
+        }
+    }
+
+    fn wrap_udp_socket(&self, sock: UdpSocket) -> io::Result<Box<dyn AsyncUdpSocket>> {
+        TokioRuntime.wrap_udp_socket(sock)
+    }
+
+    fn now(&self) -> Instant {
+        TokioRuntime.now()
+    }
+}
+
+/// A `wait_all_draining` already parked when the endpoint driver drops is woken and returns.
+///
+/// `EndpointDriver::drop` sets `active_connections = 0` and notifies only `incoming`; the one
+/// `all_draining.notify_waiters()` is in `State::handle_events`, which a dropped driver never runs
+/// again. A waiter parked on `all_draining` with one live connection is therefore never woken
+/// after the driver drops (runtime shutdown, or the driver's own exit on an I/O error), though the
+/// count it waits on is already zero.
+#[test]
+fn wait_all_draining_parked_before_the_driver_drops_is_woken() {
+    let _guard = subscribe();
+    let runtime = rt_basic();
+    let hold = Arc::new(HoldEndpointDriver::default());
+    let endpoint = {
+        let _rt = runtime.enter();
+        EndpointFactory::new().endpoint_with_runtime("ep", TransportConfig::default(), hold.clone())
+    };
+    runtime.block_on(async move {
+        // One connection: `ConnectionSet::insert` counts it in `active_connections`.
+        let _connecting = endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap();
+        let mut waiting = pin!(endpoint.wait_all_draining());
+        let first = std::future::poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx))).await;
+        assert!(first.is_pending(), "one connection is active: the waiter parks on all_draining");
+
+        let driver = hold.held.lock().unwrap().take().expect("the endpoint driver was spawned");
+        drop(driver);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("the driver dropped and active_connections is 0: the parked wait_all_draining must be woken");
+    });
+}
